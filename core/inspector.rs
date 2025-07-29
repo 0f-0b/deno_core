@@ -16,8 +16,9 @@ use crate::futures::prelude::*;
 use crate::futures::stream::SelectAll;
 use crate::futures::stream::StreamExt;
 use crate::futures::task;
-use crate::serde_json::Value;
-use crate::serde_json::json;
+use crate::serde::Deserialize;
+use crate::serde::Serialize;
+use crate::serde_json::value::RawValue;
 
 use boxed_error::Boxed;
 use deno_error::JsErrorBox;
@@ -40,8 +41,8 @@ use thiserror::Error;
 use v8::HandleScope;
 
 pub enum InspectorMsgKind {
+  Response { call_id: i32 },
   Notification,
-  Message(i32),
 }
 
 pub struct InspectorMsg {
@@ -774,7 +775,7 @@ impl v8::inspector::ChannelImpl for InspectorSession {
     call_id: i32,
     message: v8::UniquePtr<v8::inspector::StringBuffer>,
   ) {
-    self.send_message(InspectorMsgKind::Message(call_id), message);
+    self.send_message(InspectorMsgKind::Response { call_id }, message);
   }
 
   fn send_notification(
@@ -841,10 +842,10 @@ impl InspectorPostMessageError {
 pub struct LocalInspectorSession {
   v8_session_tx: UnboundedSender<String>,
   v8_session_rx: UnboundedReceiver<InspectorMsg>,
-  response_tx_map: HashMap<i32, oneshot::Sender<serde_json::Value>>,
-  next_message_id: i32,
-  notification_tx: UnboundedSender<Value>,
-  notification_rx: Option<UnboundedReceiver<Value>>,
+  response_tx_map: HashMap<i32, oneshot::Sender<Box<RawValue>>>,
+  next_call_id: i32,
+  notification_tx: UnboundedSender<Box<RawValue>>,
+  notification_rx: Option<UnboundedReceiver<Box<RawValue>>>,
 }
 
 impl LocalInspectorSession {
@@ -853,21 +854,21 @@ impl LocalInspectorSession {
     v8_session_rx: UnboundedReceiver<InspectorMsg>,
   ) -> Self {
     let response_tx_map = HashMap::new();
-    let next_message_id = 0;
+    let next_call_id = 0;
 
-    let (notification_tx, notification_rx) = mpsc::unbounded::<Value>();
+    let (notification_tx, notification_rx) = mpsc::unbounded::<Box<RawValue>>();
 
     Self {
       v8_session_tx,
       v8_session_rx,
       response_tx_map,
-      next_message_id,
+      next_call_id,
       notification_tx,
       notification_rx: Some(notification_rx),
     }
   }
 
-  pub fn take_notification_rx(&mut self) -> UnboundedReceiver<Value> {
+  pub fn take_notification_rx(&mut self) -> UnboundedReceiver<Box<RawValue>> {
     self.notification_rx.take().unwrap()
   }
 
@@ -875,19 +876,21 @@ impl LocalInspectorSession {
     &mut self,
     method: &str,
     params: Option<T>,
-  ) -> Result<serde_json::Value, InspectorPostMessageError> {
-    let id = self.next_message_id;
-    self.next_message_id += 1;
+  ) -> Result<Box<RawValue>, InspectorPostMessageError> {
+    let id = self.next_call_id;
+    self.next_call_id += 1;
 
-    let (response_tx, mut response_rx) =
-      oneshot::channel::<serde_json::Value>();
+    let (response_tx, mut response_rx) = oneshot::channel::<Box<RawValue>>();
     self.response_tx_map.insert(id, response_tx);
 
-    let message = json!({
-        "id": id,
-        "method": method,
-        "params": params,
-    });
+    #[derive(Debug, Serialize)]
+    struct Request<'a, T> {
+      id: i32,
+      method: &'a str,
+      params: Option<T>,
+    }
+
+    let message = Request { id, method, params };
 
     let stringified_msg = serde_json::to_string(&message).unwrap();
     self.v8_session_tx.unbounded_send(stringified_msg).unwrap();
@@ -896,10 +899,22 @@ impl LocalInspectorSession {
       let receive_fut = self.receive_from_v8_session().boxed_local();
       match select(receive_fut, &mut response_rx).await {
         Either::Left(_) => continue,
-        Either::Right((result, _)) => {
+        Either::Right((response, _)) => {
+          #[derive(Debug, Deserialize)]
+          struct SuccessResponse {
+            result: Box<RawValue>,
+          }
+
+          #[derive(Debug, Deserialize)]
+          struct ErrorResponse {
+            error: Box<RawValue>,
+          }
+
           let response =
-            result.map_err(InspectorPostMessageErrorKind::FutureCanceled)?;
-          if let Some(error) = response.get("error") {
+            response.map_err(InspectorPostMessageErrorKind::FutureCanceled)?;
+          if let Ok(ErrorResponse { error }) =
+            Deserialize::deserialize(&*response)
+          {
             return Err(
               InspectorPostMessageErrorKind::JsBox(JsErrorBox::generic(
                 error.to_string(),
@@ -908,7 +923,8 @@ impl LocalInspectorSession {
             );
           }
 
-          let result = response.get("result").unwrap().clone();
+          let SuccessResponse { result } =
+            Deserialize::deserialize(&*response).unwrap();
           return Ok(result);
         }
       }
@@ -917,41 +933,21 @@ impl LocalInspectorSession {
 
   pub async fn receive_from_v8_session(&mut self) {
     let inspector_msg = self.v8_session_rx.next().await.unwrap();
-    if let InspectorMsgKind::Message(msg_id) = inspector_msg.kind {
-      let message: serde_json::Value =
-        match serde_json::from_str(&inspector_msg.content) {
-          Ok(v) => v,
-          Err(error) => match error.classify() {
-            serde_json::error::Category::Syntax => json!({
-              "id": msg_id,
-              "result": {
-                "result": {
-                  "type": "error",
-                  "description": "Unterminated string literal",
-                  "value": "Unterminated string literal",
-                },
-                "exceptionDetails": {
-                  "exceptionId": 0,
-                  "text": "Unterminated string literal",
-                  "lineNumber": 0,
-                  "columnNumber": 0
-                },
-              },
-            }),
-            _ => panic!("Could not parse inspector message"),
-          },
-        };
-
-      self
-        .response_tx_map
-        .remove(&msg_id)
-        .unwrap()
-        .send(message)
-        .unwrap();
-    } else {
-      let message = serde_json::from_str(&inspector_msg.content).unwrap();
-      // Ignore if the receiver has been dropped.
-      let _ = self.notification_tx.unbounded_send(message);
+    let message = RawValue::from_string(inspector_msg.content)
+      .expect("Could not parse inspector message");
+    match inspector_msg.kind {
+      InspectorMsgKind::Response { call_id } => {
+        self
+          .response_tx_map
+          .remove(&call_id)
+          .unwrap()
+          .send(message)
+          .unwrap();
+      }
+      InspectorMsgKind::Notification => {
+        // Ignore if the receiver has been dropped.
+        let _ = self.notification_tx.unbounded_send(message);
+      }
     }
   }
 }

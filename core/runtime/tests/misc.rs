@@ -497,7 +497,7 @@ async fn local_inspector_evaluate(
     )
     .await?;
 
-  Ok(remote_object_result)
+  Ok(serde_json::to_value(remote_object_result).unwrap())
 }
 
 #[test]
